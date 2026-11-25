@@ -79,6 +79,7 @@ import {
   type LeasedChannel,
   type Signer,
 } from './stellar/channels';
+import { bindChannelLeaseToOutbox, releaseChannelLeaseForOutbox } from './stellar/channel-lease';
 
 export { ExpiredError, ArchivedEntryError };
 
@@ -324,6 +325,8 @@ async function submitWrite<T>(
   const timeoutInSeconds = timeoutFor(opClass);
 
   let leasedChannel: LeasedChannel | null = null;
+  /** Set when the channel lease is held for an in-flight outbox row (#275). */
+  const channelLeaseHold = { outboxId: null as string | null };
   let signer: Signer | undefined = undefined;
 
   if (config.CHAIN_EXECUTION_MODE === 'live') {
@@ -484,6 +487,10 @@ async function submitWrite<T>(
       sequence: rawTx?.built?.sequence != null ? String(rawTx.built.sequence) : null,
     });
     if (signedRow) outboxRow = signedRow;
+    if (leasedChannel) {
+      await bindChannelLeaseToOutbox(outboxRow.id, leasedChannel.channel.publicKey, leasedChannel.leaseToken);
+      channelLeaseHold.outboxId = outboxRow.id;
+    }
   }
 
   const sender = getTransactionSender();
@@ -560,9 +567,10 @@ async function submitWrite<T>(
     submittedLedger,
     submittedAtCloseTime,
     signal,
+    channelLeaseHold,
   });
   } finally {
-    if (leasedChannel) {
+    if (leasedChannel && !channelLeaseHold.outboxId) {
       await leasedChannel.release();
     }
   }
@@ -885,6 +893,7 @@ interface ConfirmInput<T> {
   submittedLedger: number | undefined;
   submittedAtCloseTime: bigint | undefined;
   signal?: AbortSignal;
+  channelLeaseHold?: { outboxId: string | null };
 }
 
 /**
@@ -897,6 +906,11 @@ interface ConfirmInput<T> {
 async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> {
   const { store, contract, method, opClass, args, tx, reader, sendRes, minTime, maxTime, timeoutInSeconds, finalHash } = c;
   let outboxRow = c.outboxRow;
+
+  const clearChannelLeaseHold = async () => {
+    await releaseChannelLeaseForOutbox(outboxRow.id, store);
+    if (c.channelLeaseHold) c.channelLeaseHold.outboxId = null;
+  };
 
   if (sendRes?.latestLedgerCloseTime) {
     const hostSec = Math.floor(Date.now() / 1000);
@@ -980,6 +994,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
             handledAt: new Date(),
           })
           .catch(() => undefined);
+        await clearChannelLeaseHold();
         throw new ExpiredError(`Transaction ${finalHash} expired without inclusion`, attemptId, finalHash);
       }
 
@@ -1021,6 +1036,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
         handledAt: new Date(),
       })
       .catch(() => undefined);
+    await clearChannelLeaseHold();
     throw new ChainError(`${method} failed on-chain: ${errName ?? 'Unknown error'}`, errName, { method, txHash: finalHash });
   }
 
@@ -1079,6 +1095,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
     }
   } catch {}
 
+  await clearChannelLeaseHold();
   logger.info({ method, txHash: finalHash, outboxId: outboxRow.id }, 'submitted and confirmed');
   return { mode: 'live', method, value, txHash: finalHash, fee: liveFeeDetails, outboxId: outboxRow.id };
 }

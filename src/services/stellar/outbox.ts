@@ -32,6 +32,7 @@ import { readClients, rpcServer } from './clients';
 import { contractErrorName } from './errors';
 import { FeeBumpCapExceeded, buildFeeBump, innerInclusionPerOp, planBump } from './fee-bump';
 import { decideExpiry, type ExpiryDecision } from './timebounds';
+import { renewChannelLeaseForOutbox, releaseChannelLeaseForOutbox } from './channel-lease';
 
 export type OutboxStatus = 'BUILT' | 'SIGNED' | 'SUBMITTED' | 'PENDING' | 'SUCCESS' | 'FAILED' | 'EXPIRED';
 
@@ -530,6 +531,8 @@ export async function recoverRow(
   const store = deps.store ?? prismaOutboxStore();
   const nowSecs = deps.now ? deps.now() : Math.floor(Date.now() / 1000);
 
+  await renewChannelLeaseForOutbox(row.id).catch(() => undefined);
+
   // Crash between create and sign: nothing was signed, nothing can land.
   if (row.status === 'BUILT') {
     const moved = await store.transition(row.id, ['BUILT'], 'FAILED', { error: 'abandoned before signing' });
@@ -537,6 +540,7 @@ export async function recoverRow(
       await runCompletionHandler(moved, { status: 'FAILED', error: moved.error }, store);
       stats.resolved++;
       stats.handled++;
+      await releaseChannelLeaseForOutbox(moved.id, store);
     }
     return stats;
   }
@@ -569,6 +573,7 @@ export async function recoverRow(
         await runCompletionHandler(moved, { status: 'SUCCESS', value, txHash: landed.hash }, store);
         stats.resolved++;
         stats.handled++;
+        await releaseChannelLeaseForOutbox(moved.id, store);
       }
     } else {
       const error = contractErrorName((row.contract ?? 'treasury') as BindingContract, landed.resp) ?? 'transaction failed on-chain';
@@ -577,6 +582,7 @@ export async function recoverRow(
         await runCompletionHandler(moved, { status: 'FAILED', error, txHash: landed.hash }, store);
         stats.resolved++;
         stats.handled++;
+        await releaseChannelLeaseForOutbox(moved.id, store);
       }
     }
     return stats;
@@ -598,6 +604,7 @@ export async function recoverRow(
       await runCompletionHandler(moved, { status: 'EXPIRED', txHash: row.hash }, store);
       stats.expired++;
       stats.handled++;
+      await releaseChannelLeaseForOutbox(moved.id, store);
     }
     return stats;
   }
@@ -617,6 +624,7 @@ export async function recoverRow(
         if (moved) {
           await runCompletionHandler(moved, { status: 'FAILED', error: moved.error }, store);
           stats.handled++;
+          await releaseChannelLeaseForOutbox(moved.id, store);
         }
       }
       // TRY_AGAIN_LATER: leave SIGNED; the next pass retries.
@@ -763,6 +771,7 @@ async function bumpRow(
             },
             store,
           );
+          await releaseChannelLeaseForOutbox(moved.id, store);
         }
       }
     }
